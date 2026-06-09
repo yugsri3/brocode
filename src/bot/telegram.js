@@ -1,4 +1,3 @@
-// BroCode Telegram Bot 🤖
 const { Telegraf } = require('telegraf');
 const { loadMemory, saveMemory, addConversation, addOrder, addEvent, getMemorySummary, updateCore } = require('../memory/memory');
 const { searchWeb, needsSearch } = require('../search/search');
@@ -7,36 +6,100 @@ const Groq = require('groq-sdk');
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// BroCode ki personality
+// Active reminders store
+const activeReminders = new Map();
+
+// IST time helper
+function getISTTime() {
+  return new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+}
+
+function getISTHourMin() {
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  return { hour: now.getHours(), min: now.getMinutes() };
+}
+
+// Reminder parser — "3:36 ka khana" → {hour:15, min:36, msg:"khana khao!"}
+function parseReminder(text) {
+  const timeRegex = /(\d{1,2}):(\d{2})/;
+  const match = text.match(timeRegex);
+  if (!match) return null;
+  
+  let hour = parseInt(match[1]);
+  let min = parseInt(match[2]);
+  
+  // PM detection
+  if (text.toLowerCase().includes('pm') && hour < 12) hour += 12;
+  if (text.toLowerCase().includes('am') && hour === 12) hour = 0;
+  
+  return { hour, min, original: text };
+}
+
+// Set reminder
+function setReminder(userId, reminderText, ctx) {
+  const parsed = parseReminder(reminderText);
+  if (!parsed) return false;
+
+  const { hour, min } = parsed;
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  
+  // Calculate delay in ms
+  const target = new Date(now);
+  target.setHours(hour, min, 0, 0);
+  
+  if (target <= now) {
+    target.setDate(target.getDate() + 1); // Kal ke liye
+  }
+  
+  const delay = target.getTime() - now.getTime();
+  const key = `${userId}_${hour}_${min}`;
+  
+  // Clear existing reminder if any
+  if (activeReminders.has(key)) {
+    clearTimeout(activeReminders.get(key));
+  }
+  
+  const timer = setTimeout(async () => {
+    try {
+      await bot.telegram.sendMessage(userId, 
+        `⏰ REMINDER!\n\n${reminderText}\n\nYaad hai na? Main bhoolne nahi dunga! 💪`
+      );
+      activeReminders.delete(key);
+    } catch(e) {
+      console.error('Reminder error:', e.message);
+    }
+  }, delay);
+  
+  activeReminders.set(key, timer);
+  
+  const mins = Math.round(delay / 60000);
+  return mins;
+}
+
 const BROCODE_PERSONALITY = `
-CRITICAL RULES:
-- Agar search result hai toh SIRF wahi use kar — apni knowledge mat use kar
-- Agar search result nahi hai toh bol "abhi search nahi ho paya, but..."  
-- KABHI hallucinate mat kar — galat info mat de
-- Current time: ${new Date().toLocaleString('en-IN', {timeZone: 'Asia/Kolkata'})}
-- Agar time poochhe toh upar wala current time use kar
 Tu BroCode hai — ek personal AI dost jo sirf is user ka hai.
 
-PERSONALITY:
-- Tu seedha bolta hai — sach bolta hai, chahe sunne mein kadwa lage
-- Tu dost ki tarah baat karta hai — formal nahi, real hai
-- Tu kabhi haan mein haan nahi milata — galat cheez galat bolta hai
-- Tu judge nahi karta — but sach zaroor bolta hai
-- Tu caring hai — user ki genuine parwah karta hai
-- Tu Hindi/Hinglish mein baat karta hai — jaise dost karta hai
-- Tu memory use karta hai — "tune pehle bola tha..." wali approach
-- Tu proactive hai — patterns dekhta hai, khud suggest karta hai
+CRITICAL RULES:
+- Current IST time: ${getISTTime()}
+- Agar search result hai toh SIRF wahi use kar
+- Agar search nahi mila toh seedha bol "search nahi ho paya"
+- KABHI hallucinate mat kar
+- Reminder set karne par seedha confirm kar — "Reminder set ho gaya X baje ke liye!"
 
-RULES:
-1. Kabhi fake positivity mat de
-2. Memory mein jo hai usse connect kar
-3. Agar search result hai toh use karo — accurate raho
-4. Short replies — dost jaisa, essay nahi
-5. Emoji use karo — but zyada nahi
-6. User ki feelings validate karo — but reality bhi batao
+PERSONALITY:
+- Tu seedha bolta hai — sach bolta hai
+- Tu dost ki tarah baat karta hai — formal nahi
+- Tu kabhi haan mein haan nahi milata
+- Tu caring hai — user ki genuine parwah
+- Tu Hindi/Hinglish mein baat karta hai
+- Short replies — dost jaisa
+
+REMINDER DETECTION:
+- Agar user "remind kar", "yaad dilana", "X baje batana" bole
+- Toh seedha confirm kar aur [REMINDER:HH:MM:message] format mein likho
+- Example: [REMINDER:15:36:khana khao bhai!]
 `;
 
-// Groq se reply lao
 async function getBroCodeReply(userId, userMessage, searchResult = null) {
   const memory = getMemorySummary(userId);
   const mem = loadMemory(userId);
@@ -49,7 +112,7 @@ async function getBroCodeReply(userId, userMessage, searchResult = null) {
   let systemPrompt = BROCODE_PERSONALITY + '\n\n' + memory;
   
   if (searchResult) {
-    systemPrompt += `\n\nREAL TIME SEARCH RESULT:\n${searchResult}\nYeh fresh info use kar apne jawab mein.`;
+    systemPrompt += `\n\nSEARCH RESULT (yahi use kar):\n${searchResult}`;
   }
 
   const messages = [
@@ -61,13 +124,51 @@ async function getBroCodeReply(userId, userMessage, searchResult = null) {
   const response = await groq.chat.completions.create({
     model: 'llama-3.3-70b-versatile',
     max_tokens: 500,
-    messages: messages
+    messages
   });
 
   return response.choices[0].message.content;
 }
 
-// /start command
+// Parse reminder from bot response
+function extractAndSetReminder(userId, botReply) {
+  const reminderRegex = /\[REMINDER:(\d{2}):(\d{2}):([^\]]+)\]/;
+  const match = botReply.match(reminderRegex);
+  
+  if (match) {
+    const hour = parseInt(match[1]);
+    const min = parseInt(match[2]);
+    const msg = match[3];
+    
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const target = new Date(now);
+    target.setHours(hour, min, 0, 0);
+    if (target <= now) target.setDate(target.getDate() + 1);
+    
+    const delay = target.getTime() - now.getTime();
+    const key = `${userId}_${hour}_${min}`;
+    
+    if (activeReminders.has(key)) clearTimeout(activeReminders.get(key));
+    
+    const timer = setTimeout(async () => {
+      try {
+        await bot.telegram.sendMessage(userId,
+          `⏰ REMINDER!\n\n${msg}\n\n💪`
+        );
+        activeReminders.delete(key);
+      } catch(e) {
+        console.error('Reminder error:', e.message);
+      }
+    }, delay);
+    
+    activeReminders.set(key, timer);
+    return botReply.replace(reminderRegex, '').trim();
+  }
+  
+  return botReply;
+}
+
+// /start
 bot.start(async (ctx) => {
   const userId = ctx.from.id.toString();
   const mem = loadMemory(userId);
@@ -80,96 +181,72 @@ bot.start(async (ctx) => {
   }
 });
 
-// /order command
+// /order
 bot.command('order', async (ctx) => {
   const userId = ctx.from.id.toString();
-  const order = ctx.message.text.replace('/order ', '');
-  
+  const order = ctx.message.text.replace('/order ', '').trim();
   if (!order || order === '/order') {
-    ctx.reply('Bhai order kya hai? Likh — /order roz subah 7 baje uthao');
+    ctx.reply('Format: /order roz subah 7 baje uthao');
     return;
   }
-  
+  const { addOrder } = require('../memory/memory');
   addOrder(userId, order);
-  ctx.reply(`Order note kar liya bhai! ✅\n"${order}"\nYeh main hamesha follow karunga! 💪`);
+  ctx.reply(`Order note kar liya! ✅\n"${order}"\nHamesha follow karunga! 💪`);
 });
 
-// /memory command
+// /memory
 bot.command('memory', async (ctx) => {
   const userId = ctx.from.id.toString();
   const mem = loadMemory(userId);
-  
-  const summary = `
-🧠 *Meri Memory — ${mem.core.name}*
-
-👤 *Core*
-Naam: ${mem.core.name || '?'}
-Age: ${mem.core.age || '?'}
-City: ${mem.core.city || '?'}
-
-📅 *Orders* (${mem.orders.length})
-${mem.orders.slice(-3).map(o => `• ${o.instruction}`).join('\n') || 'Koi order nahi'}
-
-📌 *Events* (${mem.events.length})
-${mem.events.slice(-3).map(e => `• ${e.title} — ${e.date}`).join('\n') || 'Koi event nahi'}
-
-💬 *Conversations saved:* ${mem.conversations.length}
-  `.trim();
-  
+  const summary = `🧠 *BroCode Memory*\n\n👤 Naam: ${mem.core.name}\nAge: ${mem.core.age}\nCity: ${mem.core.city}\n\n📅 Orders: ${mem.orders.length}\n📌 Events: ${mem.events.length}\n💬 Conversations: ${mem.conversations.length}`;
   ctx.replyWithMarkdown(summary);
 });
 
-// /event command
-bot.command('event', async (ctx) => {
+// /remind — direct reminder
+bot.command('remind', async (ctx) => {
   const userId = ctx.from.id.toString();
-  const text = ctx.message.text.replace('/event ', '');
-  const parts = text.split('|');
+  const text = ctx.message.text.replace('/remind ', '').trim();
+  const mins = setReminder(userId, text, ctx);
   
-  if (parts.length < 2) {
-    ctx.reply('Format: /event Exam|2026-06-15');
-    return;
+  if (mins) {
+    ctx.reply(`⏰ Reminder set! ${mins} minute mein bataunga!\n"${text}"`);
+  } else {
+    ctx.reply('Format: /remind 4:30 PM gym jaana hai\nYa baat karte karte bol do — main set kar dunga!');
   }
-  
-  addEvent(userId, { title: parts[0].trim(), date: parts[1].trim() });
-  ctx.reply(`Event note kar liya! ✅\n📅 ${parts[0].trim()} — ${parts[1].trim()}`);
 });
 
-// Main message handler
+// Main handler
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id.toString();
   const userMessage = ctx.message.text;
   const mem = loadMemory(userId);
 
-  // Onboarding flow
+  // Onboarding
   if (mem.core.onboarding === 'name') {
     updateCore(userId, { name: userMessage, onboarding: 'age' });
-    ctx.reply(`${userMessage}! Accha naam hai! 😄\n\nKitne saal ka hai tu?`);
+    ctx.reply(`${userMessage}! Accha naam! 😄\n\nKitne saal ka hai?`);
     return;
   }
-  
   if (mem.core.onboarding === 'age') {
     updateCore(userId, { age: userMessage, onboarding: 'city' });
-    ctx.reply(`Theek hai! Kaunse city mein hai?`);
+    ctx.reply(`Kaunse city mein hai?`);
     return;
   }
-  
   if (mem.core.onboarding === 'city') {
     updateCore(userId, { city: userMessage, onboarding: 'occupation' });
-    ctx.reply(`${userMessage}! Cool!\n\nKya karta hai — student hai ya job?`);
+    ctx.reply(`${userMessage}! Kya karta hai — student ya job?`);
     return;
   }
-
   if (mem.core.onboarding === 'occupation') {
     updateCore(userId, { occupation: userMessage, onboarding: 'goal' });
-    ctx.reply(`Nice! Ek cheez bata — abhi life mein sabse bada goal kya hai?`);
+    ctx.reply(`Life mein sabse bada goal kya hai abhi?`);
     return;
   }
-
   if (mem.core.onboarding === 'goal') {
     const goals = mem.core.goals || [];
     goals.push(userMessage);
     updateCore(userId, { goals, onboarding: 'done' });
-    ctx.reply(`Goal note kar liya! 🎯\n\n"${userMessage}"\n\nBhai main yaad rakhunga — aur remind bhi karunga!\n\nAb baat kar — kuch bhi puch, kuch bhi bol. Main hoon! 💪`);
+    ctx.reply(`Goal note kar liya! 🎯\n\n"${userMessage}"\n\nYaad rakhunga aur remind bhi karunga!\n\nAb baat kar — kuch bhi! Main hoon! 💪`);
     return;
   }
 
@@ -181,7 +258,10 @@ bot.on('text', async (ctx) => {
       searchResult = await searchWeb(userMessage);
     }
 
-    const reply = await getBroCodeReply(userId, userMessage, searchResult);
+    let reply = await getBroCodeReply(userId, userMessage, searchResult);
+    
+    // Reminder extract karo agar hai
+    reply = extractAndSetReminder(userId, reply);
 
     addConversation(userId, 'user', userMessage);
     addConversation(userId, 'assistant', reply);
@@ -190,7 +270,7 @@ bot.on('text', async (ctx) => {
 
   } catch (error) {
     console.error('Bot error:', error);
-    ctx.reply('Bhai thoda dikkat aa gayi — ek minute mein wapas aata hoon! 🔧');
+    ctx.reply('Thoda dikkat aa gayi — ek second! 🔧');
   }
 });
 
