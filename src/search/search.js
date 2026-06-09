@@ -1,33 +1,32 @@
-// BroCode Search System 🔍
-// Real-time web search — zero hallucination
-
 const axios = require('axios');
 
 async function searchWeb(query) {
   try {
-    // Tavily API se real time search
     const response = await axios.post(
       'https://api.tavily.com/search',
       {
         api_key: process.env.TAVILY_API_KEY,
         query: query,
-        search_depth: 'basic',
-        max_results: 3
+        search_depth: 'advanced',
+        max_results: 5,
+        include_answer: true
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000
       }
     );
 
-    const results = response.data.results;
-    
-    if (!results || results.length === 0) {
-      return 'Koi result nahi mila bhai.';
+    if (response.data.answer) {
+      return `VERIFIED ANSWER: ${response.data.answer}`;
     }
 
-    // Results format karo
-    const formatted = results.map((r, i) => 
-      `${i + 1}. ${r.title}\n${r.content}`
-    ).join('\n\n');
+    const results = response.data.results;
+    if (!results || results.length === 0) return null;
 
-    return formatted;
+    return results.slice(0, 3).map((r, i) =>
+      `${i + 1}. ${r.title}: ${r.content?.slice(0, 200)}`
+    ).join('\n\n');
 
   } catch (error) {
     console.error('Search error:', error.message);
@@ -35,17 +34,16 @@ async function searchWeb(query) {
   }
 }
 
-// Check karo ki search chahiye ya nahi
 function needsSearch(message) {
-  const searchTriggers = [
-    'aaj', 'today', 'abhi', 'latest', 'news',
-    'price', 'kitna', 'kya hai', 'kaise', 'best',
-    'recommend', 'weather', 'score', 'result',
-    'new', 'naya', 'update', '2026', 'current'
+  const triggers = [
+    'aaj', 'kal', 'abhi', 'time', 'kitna', 'kya hai',
+    'news', 'latest', 'price', 'kitne', 'bata', 'batao',
+    'kaun', 'kab', 'kahan', 'weather', 'score', 'result',
+    'today', 'current', '2026', 'new', 'update', 'jeeta',
+    'haar', 'winner', 'ipl', 'match', 'election'
   ];
-  
   const lower = message.toLowerCase();
-  return searchTriggers.some(trigger => lower.includes(trigger));
+  return triggers.some(t => lower.includes(t));
 }
 
 module.exports = { searchWeb, needsSearch };
